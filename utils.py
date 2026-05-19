@@ -2,11 +2,9 @@ import os
 import sys as _sys
 import copy
 from pathlib import Path
-
 import torch
 import torch.nn as nn
 import numpy as np
-
 from NN import Main_Network
 
 # ------------------------------------------------------------------
@@ -276,10 +274,8 @@ def fuse_normalizer_into_nn(nn_with_norm, input_mean, input_std, output_mean, ou
 
     # Disable normalizer in forward
     net.normalizer = None
-
     return net
 
-    
 def load_net(model_path, model_name, x_dim, z_dim, hidden_sizes, inverse_size, load_decoder = True):
     encoder_checkpoint = torch.load(f"{model_path}/{model_name}", map_location=device, weights_only=False)
     decoder_name = model_name.replace('encoder', 'decoder')
@@ -312,6 +308,174 @@ def load_net(model_path, model_name, x_dim, z_dim, hidden_sizes, inverse_size, l
         decoder = None
     
     return encoder, decoder
+
+def _strip_module_prefix(state_dict):
+    """
+    Handles checkpoints saved from DataParallel-like wrappers.
+    """
+    new_state = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            new_state[k[len("module."):]] = v
+        else:
+            new_state[k] = v
+    return new_state
+
+def _resolve_activation(activation):
+    """
+    Convert a saved activation entry into a callable.
+    Handles callables, strings, and missing values.
+    """
+    if activation is None:
+        return torch.tanh
+
+    if callable(activation):
+        return activation
+
+    if isinstance(activation, str):
+        name = activation.lower()
+        if name in {"tanh", "torch.tanh"}:
+            return torch.tanh
+        if name in {"relu", "torch.relu"}:
+            return torch.relu
+        if name in {"sigmoid", "torch.sigmoid"}:
+            return torch.sigmoid
+        if name in {"selu", "torch.selu"}:
+            return torch.selu
+
+    raise ValueError(f"Unsupported activation stored in checkpoint: {activation!r}")
+
+def _infer_hidden_sizes(config, *, kind, hidden_sizes):
+    """
+    Infer hidden_sizes from the checkpoint config or from the argument.
+    Returns a list like [100, 100, 100].
+    """
+    if hidden_sizes is not None:
+        return list(hidden_sizes)
+
+    # Most likely format
+    if kind == "forward":
+        for key in ["hidden_sizes", "encoder_hidden_sizes", "forward_hidden_sizes"]:
+            if key in config and config[key] is not None:
+                return list(config[key])
+
+    if kind == "inverse":
+        for key in ["inverse_size", "inverse_hidden_sizes", "decoder_hidden_sizes", "hidden_sizes"]:
+            if key in config and config[key] is not None:
+                return list(config[key])
+
+    # Older format: num_hidden + hidden_size
+    num_hidden = config.get("num_hidden", None)
+    hidden_size = config.get("hidden_size", None)
+
+    if num_hidden is not None and hidden_size is not None:
+        return [int(hidden_size)] * int(num_hidden)
+
+    raise ValueError(
+        "Could not infer hidden_sizes from checkpoint config. "
+        "Please pass hidden_sizes explicitly."
+    )
+
+def _extract_state_dict(checkpoint):
+    """
+    Accept a few common checkpoint formats.
+    """
+    for key in ["model", "model_state_dict", "state_dict"]:
+        if key in checkpoint:
+            state = checkpoint[key]
+            break
+    else:
+        raise ValueError(
+            "Checkpoint does not contain a model state dict. "
+            "Expected one of: 'model', 'model_state_dict', or 'state_dict'."
+        )
+
+    if isinstance(state, nn.Module):
+        state = state.state_dict()
+
+    if not isinstance(state, dict):
+        raise TypeError(f"Expected state dict, got {type(state)}.")
+
+    return _strip_module_prefix(state)
+
+
+def _float_normalizer_tensors(normalizer):
+    """
+    Make normalizer tensors float32 if the normalizer object exists.
+    This matches what your legacy load_net function does.
+    """
+    if normalizer is None:
+        return None
+
+    for attr in [
+        "mean_x", "std_x", "mean_z", "std_z",
+        "mean_x_ph", "std_x_ph", "mean_z_ph", "std_z_ph",
+    ]:
+        if hasattr(normalizer, attr):
+            val = getattr(normalizer, attr)
+            if torch.is_tensor(val):
+                setattr(normalizer, attr, val.float())
+
+    return normalizer
+
+
+def _load_single_saved_model(path, *, kind, x_dim, z_dim, hidden_sizes=None, device="cpu"):
+    """
+    Load one saved Main_Network checkpoint.
+    """
+    if kind not in {"forward", "inverse"}:
+        raise ValueError("kind must be either 'forward' or 'inverse'.")
+
+    path = Path(path).expanduser()
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"{path} did not load to a dict checkpoint. Got {type(checkpoint)}.")
+
+    config = checkpoint.get("config", {})
+
+    activation = _resolve_activation(config.get("activation", torch.tanh))
+    normalizer = _float_normalizer_tensors(config.get("normalizer", checkpoint.get("normalizer", None)))
+
+    hidden_sizes = _infer_hidden_sizes(
+        config,
+        kind=kind,
+        hidden_sizes=hidden_sizes,
+    )
+
+    if kind == "forward":
+        input_size = config.get("input_size", config.get("x_size", x_dim))
+        output_size = config.get("output_size", config.get("z_size", z_dim))
+    else:
+        input_size = config.get(
+            "inverse_input_size",
+            config.get("input_size", config.get("z_size", z_dim)),
+        )
+        output_size = config.get(
+            "inverse_output_size",
+            config.get("output_size", config.get("x_size", x_dim)),
+        )
+
+    input_size = int(input_size)
+    output_size = int(output_size)
+
+    model = Main_Network(input_size, output_size, hidden_sizes=hidden_sizes, activation=activation, normalizer=normalizer).to(device)
+
+    state_dict = _extract_state_dict(checkpoint)
+
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Failed to load checkpoint strictly from {path}.\n"
+            f"This usually means the inferred architecture is wrong.\n"
+            f"kind={kind}, input_size={input_size}, output_size={output_size}, "
+            f"hidden_sizes={hidden_sizes}\n\n"
+            f"Original error:\n{e}"
+        ) from e
+
+    model.eval()
+    return model
 
 # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 device = 'cpu'
